@@ -238,10 +238,67 @@ end
     @assert false "Multiple concurrent writes to Dict detected!"
 end
 
+# _probe compares _GROUP slots at once, in plain Julia that LLVM vectorizes
+const _GROUP = 8
+
+# the lanes of `group` set in `valid` for which f holds (lane k in the form that LLVM turns into a mask
+# register)
+_lanes(f, group::NTuple{_GROUP, UInt32}, valid::UInt32) =
+    ntuple(k -> f(group[k]) & ((valid >> (k - 1)) % Bool), Val(_GROUP))
+# one byte per lane (:total, as inference can't see through the reinterpret)
+@assume_effects :total _bytes(t::NTuple{_GROUP, Bool}) =
+    reinterpret(UInt64, ntuple(k -> VecElement(t[k]), Val(_GROUP)))
+
+@propagate_inbounds function _isquery(h::Dict{K}, query_key, query_hsh::UInt, dense_ind::Int) where K
+    _store_hashes(K) && h.hashes[dense_ind] != query_hsh && return false
+    key = h.entries[dense_ind].first
+    return query_key === key || isequal(query_key, key)
+end
+
 """
 Returns sparse_ind, dense_ind, found
 """
-function _probe(h::Dict{K}, query_key, query_hsh::UInt) where K
+@inline function _probe(h::Dict, query_key, query_hsh::UInt)
+    slots = h.slots
+    sz = length(slots)
+    hashmask = ~((sz - 1) % UInt32)
+    short_hash = (query_hsh % UInt32) & hashmask
+    # wide and empty tables, and short hashes of 0 (which empty slots match), go one slot at a time
+    (h.wide | (sz < _GROUP) | iszero(short_hash)) && return _probe_scalar(h, query_key, query_hsh)
+    i = (query_hsh & (sz - 1)) % Int + 1
+    @assume_effects :terminates_locally :noub @inbounds begin
+        # the home slot on its own first, so that a key there doesn't wait for a vector compare
+        slot = slots[i]
+        if slot & hashmask == short_hash
+            dense_ind = (slot & (sz - 1)) % Int
+            _isquery(h, query_key, query_hsh, dense_ind) && return i, dense_ind, true
+        end
+        for _ in 1:sz
+            # a group that would cross the end of the table ends at its last slot, without the lanes before i
+            j = min(i, sz - _GROUP + 1)
+            group = ntuple(k -> @inbounds(slots[j + k - 1]), Val(_GROUP))
+            valid = typemax(UInt32) << ((i - j) & 31)
+            matches = _lanes(s -> s & hashmask == short_hash, group, valid)
+            if reduce(|, matches)
+                cand = _bytes(matches)
+                while true
+                    lane = trailing_zeros(cand) >> 3
+                    dense_ind = (slots[j + lane] & (sz - 1)) % Int
+                    _isquery(h, query_key, query_hsh, dense_ind) && return j + lane, dense_ind, true
+                    cand &= cand - one(cand)
+                    iszero(cand) && break
+                end
+            end
+            empties = _lanes(iszero, group, valid)
+            reduce(|, empties) && return j + trailing_zeros(_bytes(empties)) >> 3, h.count + 1, false
+            i = j + _GROUP > sz ? 1 : j + _GROUP
+        end
+    end
+    return i, h.count + 1, false # This line is unreachable
+end
+
+# The probe one slot at a time, for what _probe leaves to it
+function _probe_scalar(h::Dict{K}, query_key, query_hsh::UInt) where K
     (;slots, hashes, entries, wide) = h
     # no out-of-line call for wide tables here: it would stop LLVM hoisting the field loads out of
     # callers' lookup loops
@@ -273,7 +330,8 @@ end
 """
 optimization to avoid hashing when only looking up from an empty dict.
 """
-function _probe_lookup(h::Dict, query_key)
+# @inline here and on the lookups below: a call per lookup costs more than the SIMD probe saves
+@inline function _probe_lookup(h::Dict, query_key)
     isempty(h) && return 0, 0, false
     return _probe(h, query_key, hash(query_key)::UInt)
 end
@@ -446,7 +504,7 @@ function get!(default::Callable, h::Dict{K,V}, key::K) where {K, V}
     return v
 end
 
-function getindex(h::Dict{K,V}, key) where {K, V}
+@inline function getindex(h::Dict{K,V}, key) where {K, V}
     sparse_ind, dense_ind, found = _probe_lookup(h, key)
     return !found ? throw(KeyError(key)) : @assume_effects :noub @inbounds h.entries[dense_ind].second
 end
@@ -473,7 +531,7 @@ julia> get(d, "c", 3)
 """
 get(collection, key, default)
 
-function get(h::Dict{K,V}, key, default) where V where K
+@inline function get(h::Dict{K,V}, key, default) where V where K
     sparse_ind, dense_ind, found = _probe_lookup(h, key)
     return !found ? default : @inbounds h.entries[dense_ind].second
 end
@@ -495,7 +553,7 @@ end
 """
 get(::Callable, collection, key)
 
-function get(default::Callable, h::Dict{K,V}, key) where V where K
+@inline function get(default::Callable, h::Dict{K,V}, key) where V where K
     sparse_ind, dense_ind, found = _probe_lookup(h, key)
     return !found ? default() : @inbounds h.entries[dense_ind].second
 end
@@ -519,8 +577,8 @@ julia> haskey(D, 'c')
 false
 ```
 """
-haskey(h::Dict, key) = (_probe_lookup(h, key)[3])
-in(key, v::KeySet{<:Any, <:Dict}) = (_probe_lookup(v.dict, key)[3])
+@inline haskey(h::Dict, key) = (_probe_lookup(h, key)[3])
+@inline in(key, v::KeySet{<:Any, <:Dict}) = (_probe_lookup(v.dict, key)[3])
 
 """
     getkey(collection, key, default)
@@ -541,7 +599,7 @@ julia> getkey(D, 'd', 'a')
 'a': ASCII/Unicode U+0061 (category Ll: Letter, lowercase)
 ```
 """
-function getkey(h::Dict{K,V}, key, default) where V where K
+@inline function getkey(h::Dict{K,V}, key, default) where V where K
     _, dense_ind, found = _probe_lookup(h, key)
     return !found ? default : @inbounds h.entries[dense_ind].first
 end
